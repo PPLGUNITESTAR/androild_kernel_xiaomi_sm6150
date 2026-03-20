@@ -27,9 +27,7 @@ on:
 
 env:
   # --- MODERN CI/CD ENFORCEMENT ---
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  NODE_OPTIONS: "--no-deprecation"
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Membungkam peringatan deprecation Node.js 20
 
   # --- NERV HQ CONFIGURATION ---
   KERNEL_NAME: "FranxxCORE"
@@ -59,7 +57,7 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # PHASE 0: DYNAMIC MATRIX ROUTING
+  # PHASE 0: DYNAMIC MATRIX ROUTING (THE ABSOLUTE SELECTION METHOD)
   # ------------------------------------------------------------------
   setup_env:
     runs-on: ubuntu-latest
@@ -71,14 +69,17 @@ jobs:
         run: |
           KSU_INPUT="${{ inputs.ksu_selector }}"
           OS_INPUT="${{ inputs.os_variant }}"
-          
+
+          echo "Inisiasi Kalkulasi Matriks..."
+          echo "KSU Target: $KSU_INPUT | OS Target: $OS_INPUT"
+
           JSON="["
-          
+
           add_target() {
             local variant_name=$1
             local is_miui=$2
             local is_ksu=$3
-            
+
             [ "$JSON" != "[" ] && JSON="$JSON,"
             JSON="$JSON{\"variant\":\"$variant_name\",\"patch_miui\":$is_miui,\"enable_ksu\":$is_ksu}"
           }
@@ -99,7 +100,8 @@ jobs:
           fi
 
           JSON="$JSON]"
-          
+
+          echo "Compiled JSON Matrix: $JSON"
           echo "matrix=$JSON" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------------
@@ -118,28 +120,29 @@ jobs:
         with:
           fetch-depth: 1
 
+      # --- PERBAIKAN FATAL LOGIC CLANG CACHE ---
       - name: "⚡ [RESTORE] :: CLANG_TOOLCHAIN"
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: aosp-clang
           key: ${{ runner.os }}-clang-${{ env.CLANG_VER }}
+          # fail-on-cache-miss: true -> DIMATIKAN! Mencegah hard-crash.
 
       - name: "🔧 [PROVISION] :: CLANG_FALLBACK"
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
+          echo "⚠️ Cache Miss! Menarik Clang secara langsung dari NERV HQ..."
           wget -q ${{ env.CLANG_URL }} -O aosp-clang.tar.gz
           mkdir -p aosp-clang
           tar -xf aosp-clang.tar.gz -C aosp-clang
           rm -f aosp-clang.tar.gz
-
-      - name: "📁 [INIT] :: PREPARE_CCACHE_DIR"
-        run: mkdir -p ${{ env.CCACHE_DIR }}
+      # -----------------------------------------
 
       - name: "⚡ [CACHE] :: CCACHE_ACCELERATION"
         uses: actions/cache@v4
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: /home/runner/.ccache
           key: ${{ runner.os }}-ccache-${{ matrix.variant }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-ccache-${{ matrix.variant }}-
@@ -161,51 +164,35 @@ jobs:
           ccache -o compression_level=1
           ccache -z
 
-      - name: "🧬 [MOD] :: KSU_BLXX_INTEGRATION"
-        if: matrix.enable_ksu == true && inputs.ksu_selector == 'KSU_BLXX'
+      - name: "🩹 [PATCH] :: KERNEL_SU & SUSFS"
+        if: matrix.enable_ksu == true
         run: |
-          apply_patch() {
-            local URL="$1"
-            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
-            wget -q "$URL" -O "$PATCHFILE"
-            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
-            rm -f "$PATCHFILE"
-          }
-          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
-          apply_patch "${{ env.KSU_KPATCH_FIX }}"
+          echo "Memulai Injeksi KernelSU..."
+          if [ "${{ inputs.ksu_selector }}" == "KSU_BLXX" ]; then
+            echo "Memilih KernelSU BLXX"
+            curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s "${{ env.KSU_BLXX_BRANCH }}"
+          elif [ "${{ inputs.ksu_selector }}" == "KSU_NEXT" ]; then
+            echo "Memilih KernelSU Next"
+            curl -LSs "${{ env.KSU_NEXT_SETUP_URI }}" | bash -s "${{ env.KSU_NEXT_BRANCH }}"
+          else
+            echo "KSU_SELECTOR tidak valid: ${{ inputs.ksu_selector }}"
+            exit 1
+          fi
 
-          curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s ${{ env.KSU_BLXX_BRANCH }}
+          echo "Mengaplikasikan Patch SUSFS Inline Hook..."
+          wget -q "${{ env.KSU_NEXT_HOOK_PATCH }}" -O susfs_inline_hook.sh
+          chmod +x susfs_inline_hook.sh
+          ./susfs_inline_hook.sh
 
-          printf '%s\n' \
-            'CONFIG_KSU=y' \
-            'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' \
-            'CONFIG_KPROBES=y' \
-            'CONFIG_HAVE_KPROBES=y' \
-            'CONFIG_KPROBE_EVENTS=y' \
-            'CONFIG_KRETPROBES=y' \
-            'CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' \
-            >> arch/arm64/configs/${{ env.DEFCONFIG }}
+          echo "Mengaplikasikan UMOUNT Patch..."
+          wget -q "${{ env.KSU_UMOUNT_PATCH }}" -O umount.patch
+          git apply --check umount.patch || echo "Umount patch apply check failed, trying to apply anyway"
+          git apply umount.patch || echo "Umount patch apply failed"
 
-      - name: "🧬 [MOD] :: KSU_NEXT_INTEGRATION"
-        if: matrix.enable_ksu == true && inputs.ksu_selector == 'KSU_NEXT'
-        run: |
-          apply_patch() {
-            local URL="$1"
-            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
-            wget -q "$URL" -O "$PATCHFILE"
-            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
-            rm -f "$PATCHFILE"
-          }
-          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
-          apply_patch "${{ env.KSU_KPATCH_FIX }}"
-
-          curl -LSs "${{ env.KSU_NEXT_HOOK_PATCH }}" | bash
-          curl -LSs "${{ env.KSU_NEXT_SETUP_URI }}" | bash -s ${{ env.KSU_NEXT_BRANCH }}
-
-          printf '%s\n' \
-            'CONFIG_KSU=y' \
-            'KSU_MANUAL_HOOK=y' \
-            >> arch/arm64/configs/${{ env.DEFCONFIG }}
+          echo "Mengaplikasikan KPATCH FIX..."
+          wget -q "${{ env.KSU_KPATCH_FIX }}" -O kpatch_fix.patch
+          git apply --check kpatch_fix.patch || echo "kpatch fix apply check failed, trying to apply anyway"
+          git apply kpatch_fix.patch || echo "kpatch fix apply failed"
 
       - name: "🩹 [PATCH] :: MIUI_OPTIMIZATION"
         if: matrix.patch_miui == true
@@ -218,6 +205,7 @@ jobs:
                   if file in targets:
                       path = os.path.join(root, file)
                       with open(path, 'r') as f: content = f.read()
+
                       content = re.sub(r'qcom,mdss-pan-physical-width-dimension\s*=\s*<[0-9]+>;', 'qcom,mdss-pan-physical-width-dimension = <695>;', content)
                       content = re.sub(r'qcom,mdss-pan-physical-height-dimension\s*=\s*<[0-9]+>;', 'qcom,mdss-pan-physical-height-dimension = <1546>;', content)
                       with open(path, 'w') as f: f.write(content)
@@ -334,6 +322,11 @@ jobs:
             
             #### 📦 DEPLOYMENT STATUS:
             Unit tereksekusi murni tanpa injeksi eksternal yang redundan.
+            **OS Variant Target:** \`${{ inputs.os_variant }}\`
+            **KSU Variant:** \`${{ inputs.ksu_selector }}\`
+
+            #### 📦 DEPLOYMENT STATUS:
+            Unit tereksekusi secara presisi berdasarkan input komputasi matriks *real-time*.
             **OS Variant Target:** \`${{ inputs.os_variant }}\`
             **KSU Variant:** \`${{ inputs.ksu_selector }}\`
 
