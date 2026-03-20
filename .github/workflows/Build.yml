@@ -1,0 +1,326 @@
+name: "Build Kernel"
+
+# ------------------------------------------------------------------
+# INPUT: KSU & OS Selector (Dynamic Routing Control)
+# ------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_selector:
+        description: "KernelSU Variant"
+        required: true
+        default: "NONE"
+        type: choice
+        options:
+          - NONE
+          - KSU_BLXX
+          - KSU_NEXT
+      os_variant:
+        description: "OS Target (Hindari redundansi komputasi)"
+        required: true
+        default: "AOSP"
+        type: choice
+        options:
+          - AOSP
+          - MIUI
+          - BOTH
+
+env:
+  # --- MODERN CI/CD ENFORCEMENT ---
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Membungkam peringatan deprecation Node.js 20
+
+  # --- NERV HQ CONFIGURATION ---
+  KERNEL_NAME: "FranxxCORE"
+  DEVICE: "Sweet"
+  CODENAME: "AHumanWorks"
+  DEFCONFIG: "sweet_defconfig"
+  CLANG_VER: "r547379"
+  CLANG_URL: "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
+
+  # --- MAGI SYSTEM IDENTITY ---
+  KBUILD_BUILD_USER: "RapliVX"
+  KBUILD_BUILD_HOST: "NyarchLinux"
+  TZ: "Asia/Jakarta"
+
+  # --- SECURITY CLEARANCE ---
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+  # --- KSU SOURCES ---
+  KSU_BLXX_SETUP_URI: "https://github.com/backslashxx/KernelSU/raw/refs/heads/master/kernel/setup.sh"
+  KSU_BLXX_BRANCH: "master"
+  KSU_NEXT_SETUP_URI: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+  KSU_NEXT_BRANCH: "legacy_susfs"
+  KSU_NEXT_HOOK_PATCH: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/raw/refs/heads/mainline/Patches/susfs_inline_hook_patches.sh"
+  KSU_UMOUNT_PATCH: "https://github.com/tbyool/android_kernel_xiaomi_sm6150/commit/64db0dfa2f8aa6c519dbf21eb65c9b89643cda3d.patch"
+  KSU_KPATCH_FIX: "https://github.com/TheSillyOk/kernel_ls_patches/raw/refs/heads/master/kpatch_fix.patch"
+
+jobs:
+  # ------------------------------------------------------------------
+  # PHASE 0: DYNAMIC MATRIX ROUTING (THE ABSOLUTE SELECTION METHOD)
+  # ------------------------------------------------------------------
+  setup_env:
+    runs-on: ubuntu-latest
+    outputs:
+      build_matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: "🧮 [MATRIX] :: GENERATE_DYNAMIC_UNITS"
+        id: set-matrix
+        run: |
+          KSU_INPUT="${{ inputs.ksu_selector }}"
+          OS_INPUT="${{ inputs.os_variant }}"
+
+          echo "Inisiasi Kalkulasi Matriks..."
+          echo "KSU Target: $KSU_INPUT | OS Target: $OS_INPUT"
+
+          JSON="["
+
+          add_target() {
+            local variant_name=$1
+            local is_miui=$2
+            local is_ksu=$3
+
+            [ "$JSON" != "[" ] && JSON="$JSON,"
+            JSON="$JSON{\"variant\":\"$variant_name\",\"patch_miui\":$is_miui,\"enable_ksu\":$is_ksu}"
+          }
+
+          KSU_STATE="false"
+          VARIANT_SUFFIX=""
+          if [ "$KSU_INPUT" != "NONE" ]; then
+            KSU_STATE="true"
+            VARIANT_SUFFIX="-ksu"
+          fi
+
+          if [[ "$OS_INPUT" == "AOSP" || "$OS_INPUT" == "BOTH" ]]; then
+            add_target "aosp$VARIANT_SUFFIX" "false" "$KSU_STATE"
+          fi
+
+          if [[ "$OS_INPUT" == "MIUI" || "$OS_INPUT" == "BOTH" ]]; then
+            add_target "miui$VARIANT_SUFFIX" "true" "$KSU_STATE"
+          fi
+
+          JSON="$JSON]"
+
+          echo "Compiled JSON Matrix: $JSON"
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------------------
+  # PHASE 1: PARALLEL BUILD
+  # ------------------------------------------------------------------
+  build:
+    needs: setup_env
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.setup_env.outputs.build_matrix) }}
+    steps:
+      - name: "⬢ [INIT] :: SOURCE_CHECKOUT"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # --- PERBAIKAN FATAL LOGIC CLANG CACHE ---
+      - name: "⚡ [RESTORE] :: CLANG_TOOLCHAIN"
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: aosp-clang
+          key: ${{ runner.os }}-clang-${{ env.CLANG_VER }}
+          # fail-on-cache-miss: true -> DIMATIKAN! Mencegah hard-crash.
+
+      - name: "🔧 [PROVISION] :: CLANG_FALLBACK"
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "⚠️ Cache Miss! Menarik Clang secara langsung dari NERV HQ..."
+          wget -q ${{ env.CLANG_URL }} -O aosp-clang.tar.gz
+          mkdir -p aosp-clang
+          tar -xf aosp-clang.tar.gz -C aosp-clang
+          rm -f aosp-clang.tar.gz
+      # -----------------------------------------
+
+      - name: "⚡ [CACHE] :: CCACHE_ACCELERATION"
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ${{ runner.os }}-ccache-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ matrix.variant }}-
+            ${{ runner.os }}-ccache-
+
+      - name: "⬢ [SYSTEM] :: DEPENDENCIES"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git libncurses5-dev libssl-dev libxml2 libxml2-utils lzop make \
+          python3 python3-pip unzip zip zlib1g-dev
+
+      - name: "⚙️ [CONFIG] :: CCACHE_SETUP"
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 2G
+          ccache -o compression=true
+          ccache -o compression_level=1
+          ccache -z
+
+      - name: "🩹 [PATCH] :: KERNEL_SU & SUSFS"
+        if: matrix.enable_ksu == true
+        run: |
+          echo "Memulai Injeksi KernelSU..."
+          if [ "${{ inputs.ksu_selector }}" == "KSU_BLXX" ]; then
+            echo "Memilih KernelSU BLXX"
+            curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s "${{ env.KSU_BLXX_BRANCH }}"
+          elif [ "${{ inputs.ksu_selector }}" == "KSU_NEXT" ]; then
+            echo "Memilih KernelSU Next"
+            curl -LSs "${{ env.KSU_NEXT_SETUP_URI }}" | bash -s "${{ env.KSU_NEXT_BRANCH }}"
+          else
+            echo "KSU_SELECTOR tidak valid: ${{ inputs.ksu_selector }}"
+            exit 1
+          fi
+
+          echo "Mengaplikasikan Patch SUSFS Inline Hook..."
+          wget -q "${{ env.KSU_NEXT_HOOK_PATCH }}" -O susfs_inline_hook.sh
+          chmod +x susfs_inline_hook.sh
+          ./susfs_inline_hook.sh
+
+          echo "Mengaplikasikan UMOUNT Patch..."
+          wget -q "${{ env.KSU_UMOUNT_PATCH }}" -O umount.patch
+          git apply --check umount.patch || echo "Umount patch apply check failed, trying to apply anyway"
+          git apply umount.patch || echo "Umount patch apply failed"
+
+          echo "Mengaplikasikan KPATCH FIX..."
+          wget -q "${{ env.KSU_KPATCH_FIX }}" -O kpatch_fix.patch
+          git apply --check kpatch_fix.patch || echo "kpatch fix apply check failed, trying to apply anyway"
+          git apply kpatch_fix.patch || echo "kpatch fix apply failed"
+
+      - name: "🩹 [PATCH] :: MIUI_OPTIMIZATION"
+        if: matrix.patch_miui == true
+        run: |
+          python3 -c "
+          import os, re
+          targets = ['dsi-panel-k6-38-0c-0a-fhd-dsc-video.dtsi', 'dsi-panel-k6-38-0e-0b-fhd-dsc-video.dtsi']
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file in targets:
+                      path = os.path.join(root, file)
+                      with open(path, 'r') as f: content = f.read()
+
+                      content = re.sub(r'qcom,mdss-pan-physical-width-dimension\s*=\s*<[0-9]+>;', 'qcom,mdss-pan-physical-width-dimension = <695>;', content)
+                      content = re.sub(r'qcom,mdss-pan-physical-height-dimension\s*=\s*<[0-9]+>;', 'qcom,mdss-pan-physical-height-dimension = <1546>;', content)
+
+                      with open(path, 'w') as f: f.write(content)
+                      print(f'Patched dimensions for MIUI in {path}')
+          "
+
+      - name: "⚔️ [COMPILE] :: KERNEL_BUILD"
+        run: |
+          export PATH="${{ github.workspace }}/aosp-clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          make O=out ${DEFCONFIG}
+
+          make -j$(nproc --all) O=out \
+            LLVM=1 LLVM_IAS=1 CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz dtbo.img dtb.img
+
+      - name: "📊 [STATS] :: CCACHE_REPORT"
+        run: ccache -s
+
+      - name: "📤 [UPLOAD] :: ARTIFACTS"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-unit
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dtb.img
+            out/arch/arm64/boot/dtbo.img
+          compression-level: 9
+
+  # ------------------------------------------------------------------
+  # PHASE 2: DEPLOYMENT (ZIPPING & RELEASING)
+  # ------------------------------------------------------------------
+  human-instrumentality:
+    name: "🧬 PROTOCOL: FINAL_DOGMA"
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+
+    steps:
+      - name: "📥 [COLLECT] :: ARTIFACTS"
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: "📦 [PACKAGE] :: ANYKERNEL3_ZIP"
+        run: |
+          mkdir -p release_zips
+          git clone -q https://github.com/RapliVx/AnyKernel3.git -b sweet AnyKernel3
+
+          cat > AnyKernel3/banner << 'EOF'
+           SORY
+           QXQVYXY
+           SNRXWYXZ                         RNKJOY
+            YXYYYYYYXY                  PLOSUYXYOXNJCV
+              YXY YXYXSRV            VTV LZUKGLDDWPARAS
+                YXYYYVUUUYY        QEAAAIXPNOJCEDLTAQAR
+                  YYYVUVT YXY     WLFPSNGPNKTLJNAUIXCHV
+                    YWQYUPTSJISPLSQAAEPHGFWGLEAJPMLM
+                      TQR RPKJHFPIVQQLYMCFTBIAJYPPNP
+                        RNTSFMGHPMAAAAKUFJURFL VRXNT
+                          WUONRTOAFGQRMLTKMOOPWWTPUVQRW
+                            XWXWOAAANOLTTMJVTMWZXXYSVTU VTV
+                              PMXPVWRSUSXSSSYOTVSUYURSXYTYSY
+                              LVNTOWJCPNUMUSWMSILQYXXYZXVSXWX
+                              QLPQGJMYNJXPSSMWSVPOKRZXYY YWXTW
+                                  WUW QHSLTUVQPJNRSO YZZVTYTXU
+                                      UIKJUOMTOSULKR ZYYUXTYVW
+                                      VTMTPGSJ         XVUYVYZ
+                                      VYTRULUM         ZYWVWXZ
+                                      WUVXSROP           YWWY
+                                       YTQZLNR
+                                       PURTWU
+                                       SOXXTU
+                                        TQOSU
+                                        YXXWX
+
+           FranxxCORE // MAMBOSU PROTOCOL
+           BY RapliVX
+          EOF
+          for DIR in ./artifacts/*-unit; do
+              VARIANT=$(basename "$DIR" -unit)
+              echo "Packaging $VARIANT..."
+
+              cp -f $DIR/Image.gz AnyKernel3/
+              cp -f $DIR/dtb.img AnyKernel3/
+              cp -f $DIR/dtbo.img AnyKernel3/
+
+              cd AnyKernel3
+              zip -r1 "../release_zips/${KERNEL_NAME}-${VARIANT}-${CODENAME}-$(date +'%Y%m%d').zip" * -x .git README.md
+              cd ..
+          done
+
+      - name: "⬆️ [RELEASE] :: GITHUB_RELEASE"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "EVA-${{ github.run_number }}"
+          name: "ProjectEVA: MAMBOSU [Run ${{ github.run_number }}]"
+          files: release_zips/*.zip
+          body: |
+            ### ⚠️ NERV SECURITY CLEARANCE REQUIRED
+            **Mission:** Kernel Instrumentality
+            **Device:** Redmi Note 10 Pro (sweet)
+            **Compiler:** Clang ${{ env.CLANG_VER }}
+
+            #### 📦 DEPLOYMENT STATUS:
+            Unit tereksekusi secara presisi berdasarkan input komputasi matriks *real-time*.
+            **OS Variant Target:** \`${{ inputs.os_variant }}\`
+            **KSU Variant:** \`${{ inputs.ksu_selector }}\`
+
+            *Synchronization Ratio: Absolute*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
